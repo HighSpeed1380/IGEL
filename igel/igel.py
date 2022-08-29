@@ -62,7 +62,10 @@ class Igel:
     """
     Igel is the base model to use the fit, evaluate and predict functions of the sklearn library
     """
-
+    new_data = None
+    count = 0
+    threshould = 20
+    
     available_commands = ("fit", "evaluate", "predict", "experiment","export")
     supported_types = ("regression", "classification", "clustering")
     results_path = configs.get("results_path")  # path to the results folder
@@ -594,6 +597,239 @@ class Igel:
             logger.exception(
                 f"Error while storing the fit description file: {e}"
             )
+    
+    
+    ##New Data means the data which we get after training using partial_fit (Online Training Method)
+    ##Generally, self.new_data is the one batch_size
+    ##self.count means the number of partial training.
+    def partial_fit(self, **kwargs):
+        
+        '''
+        fit a machine learning model and save it to a file along with a description.json file
+        @return: None
+        '''
+        if self.count < self.threshould:
+            x_train = None
+            x_test = None
+            y_train = None
+            y_test = None
+            cv_results = None
+            eval_results = None
+            cv_params = None
+            hp_search_results = {}
+            
+            ##x_train, y_train, x_test, y_test = new_data.split()
+            ## Divide by 80% and 20%
+            
+
+            self.model, model_args = self._create_model(**kwargs)
+            logger.info(f"executing a {self.model.__class__.__name__} algorithm...")
+
+            # convert to multioutput if there is more than one target to predict:
+            if self.model_type != "clustering" and len(self.target) > 1:
+                logger.info(
+                    f"predicting multiple targets detected. Hence, the model will be automatically "
+                    f"converted to a multioutput model"
+                )
+                self.model = (
+                    MultiOutputClassifier(self.model)
+                    if self.model_type == "classification"
+                    else MultiOutputRegressor(self.model)
+                )
+
+            if self.model_type != "clustering":
+                cv_params = self.model_props.get("cross_validate", None)
+                if not cv_params:
+                    logger.info(f"cross validation is not provided")
+                else:
+                    # perform cross validation
+                    logger.info("performing cross validation ...")
+                    cv_results = cross_validate(
+                        estimator=self.model, X=x_train, y=y_train, **cv_params
+                    )
+                hyperparams_props = self.model_props.get(
+                    "hyperparameter_search", None
+                )
+                if hyperparams_props:
+
+                    # perform hyperparameter search
+                    method = hyperparams_props.get("method", None)
+                    grid_params = hyperparams_props.get("parameter_grid", None)
+                    hp_args = hyperparams_props.get("arguments", None)
+                    logger.info(
+                        f"Performing hyperparameter search using -> {method}"
+                    )
+                    logger.info(
+                        f"Grid parameters entered by the user: {grid_params}"
+                    )
+                    logger.info(f"Additional hyperparameter arguments: {hp_args}")
+                    best_estimator, best_params, best_score = hyperparameter_search(
+                        model=self.model,
+                        method=method,
+                        params=grid_params,
+                        x_train=x_train,
+                        y_train=y_train,
+                        **hp_args,
+                    )
+                    hp_search_results["best_params"] = best_params
+                    hp_search_results["best_score"] = best_score
+                    self.model = best_estimator
+
+                self.model.fit(x_train, y_train)
+
+            else:  # if the model type is clustering
+                self.model.fit(x_train)
+
+            saved = self._save_model(self.model)
+            if saved:
+                logger.info(
+                    f"model saved successfully and can be found in the {self.results_path} folder"
+                )
+
+            if self.model_type == "clustering":
+                eval_results = self.model.score(x_train)
+            else:
+                if x_test is None:
+                    logger.info(
+                        f"no split options was provided. training score will be calculated"
+                    )
+                    eval_results = self.model.score(x_train, y_train)
+
+                else:
+                    logger.info(
+                        f"split option detected. The performance will be automatically evaluated "
+                        f"using the test data portion"
+                    )
+                    y_pred = self.model.predict(x_test)
+                    eval_results = self.get_evaluation(
+                        model=self.model,
+                        x_test=x_test,
+                        y_true=y_test,
+                        y_pred=y_pred,
+                        **kwargs,
+                    )
+
+            fit_description = {
+                "model": self.model.__class__.__name__,
+                "arguments": model_args if model_args else "default",
+                "type": self.model_props["type"],
+                "algorithm": self.model_props["algorithm"],
+                "dataset_props": self.dataset_props,
+                "model_props": self.model_props,
+                "data_path": self.data_path,
+                "train_data_shape": x_train.shape,
+                "test_data_shape": None if x_test is None else x_test.shape,
+                "train_data_size": x_train.shape[0],
+                "test_data_size": None if x_test is None else x_test.shape[0],
+                "results_path": str(self.results_path),
+                "model_path": str(self.default_model_path),
+                "target": None if self.model_type == "clustering" else self.target,
+                "results_on_test_data": eval_results,
+                "hyperparameter_search_results": hp_search_results,
+            }
+            if self.model_type == "clustering":
+                clustering_res = {
+                    "cluster_centers": self.model.cluster_centers_.tolist(),
+                    "cluster_labels": self.model.labels_.tolist(),
+                }
+                fit_description["clustering_results"] = clustering_res
+
+            if cv_params:
+                cv_res = {
+                    "fit_time": cv_results["fit_time"].tolist(),
+                    "score_time": cv_results["score_time"].tolist(),
+                    "test_score": cv_results["test_score"].tolist(),
+                }
+                fit_description["cross_validation_params"] = cv_params
+                fit_description["cross_validation_results"] = cv_res
+
+            try:
+                logger.info(f"saving fit description to {self.description_file}")
+                with open(self.description_file, "w", encoding="utf-8") as f:
+                    json.dump(fit_description, f, ensure_ascii=False, indent=4)
+            except Exception as e:
+                logger.exception(
+                    f"Error while storing the fit description file: {e}"
+                )
+            self.count += 1    
+        else:
+             x_train, y_train, x_test, y_test = self.new_data.split()       
+             #old_model = self.model
+             init_weight = self.model.get_params
+             self.model = self.model.fit(x_train, y_train, coef_init = init_weight)
+            saved = self._save_model(self.model)
+            if saved:
+                logger.info(
+                    f"model saved successfully and can be found in the {self.results_path} folder"
+                )
+
+            if self.model_type == "clustering":
+                eval_results = self.model.score(x_train)
+            else:
+                if x_test is None:
+                    logger.info(
+                        f"no split options was provided. training score will be calculated"
+                    )
+                    eval_results = self.model.score(x_train, y_train)
+
+                else:
+                    logger.info(
+                        f"split option detected. The performance will be automatically evaluated "
+                        f"using the test data portion"
+                    )
+                    y_pred = self.model.predict(x_test)
+                    eval_results = self.get_evaluation(
+                        model=self.model,
+                        x_test=x_test,
+                        y_true=y_test,
+                        y_pred=y_pred,
+                        **kwargs,
+                    )
+
+            fit_description = {
+                "model": self.model.__class__.__name__,
+                "arguments": model_args if model_args else "default",
+                "type": self.model_props["type"],
+                "algorithm": self.model_props["algorithm"],
+                "dataset_props": self.dataset_props,
+                "model_props": self.model_props,
+                "data_path": self.data_path,
+                "train_data_shape": x_train.shape,
+                "test_data_shape": None if x_test is None else x_test.shape,
+                "train_data_size": x_train.shape[0],
+                "test_data_size": None if x_test is None else x_test.shape[0],
+                "results_path": str(self.results_path),
+                "model_path": str(self.default_model_path),
+                "target": None if self.model_type == "clustering" else self.target,
+                "results_on_test_data": eval_results,
+                "hyperparameter_search_results": hp_search_results,
+            }
+            if self.model_type == "clustering":
+                clustering_res = {
+                    "cluster_centers": self.model.cluster_centers_.tolist(),
+                    "cluster_labels": self.model.labels_.tolist(),
+                }
+                fit_description["clustering_results"] = clustering_res
+
+            if cv_params:
+                cv_res = {
+                    "fit_time": cv_results["fit_time"].tolist(),
+                    "score_time": cv_results["score_time"].tolist(),
+                    "test_score": cv_results["test_score"].tolist(),
+                }
+                fit_description["cross_validation_params"] = cv_params
+                fit_description["cross_validation_results"] = cv_res
+
+            try:
+                logger.info(f"saving fit description to {self.description_file}")
+                with open(self.description_file, "w", encoding="utf-8") as f:
+                    json.dump(fit_description, f, ensure_ascii=False, indent=4)
+            except Exception as e:
+                logger.exception(
+                    f"Error while storing the fit description file: {e}"
+                )     
+
+             
 
     def evaluate(self, **kwargs):
         """
